@@ -7,12 +7,13 @@
 #include <netinet/in.h>
 // file control
 // fnctl() => file descriptor.
+// it returns a small integer number that OS gives us back for identification of resources
 #include <fcntl.h>
 // helps in selecting multiple file descriptors
 #include <sys/select.h>
 //
 #include <errno.h>
-#include<time.h>
+#include <time.h>
 
 #define PORT 7777
 #define MAX_CLIENTS 10
@@ -22,6 +23,9 @@ typedef struct
     int fd;
     time_t connect_time;
     int ready_to_send;
+    char write_buffer[256];
+    int write_offset;
+    int write_len;
 } client_state_t;
 
 // without this function, we have by default blocking mode, meaning until the process is
@@ -35,7 +39,9 @@ int set_nonblocking(int fd)
     // f_setfl => set new flag
     // o_nonblock => non blocking flag
     int flags = fcntl(fd, F_GETFL, 0);
-    if(flags == -1) {
+    if (flags == -1)
+    {
+        perror("fcntl F_GETFL error");
         return -1;
     }
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
@@ -47,7 +53,11 @@ int main()
     struct sockaddr_in my_addr, conn_addr;
     socklen_t addr_size = sizeof(conn_addr);
     // for reading file descriptor;
-    fd_set readfds;
+    // but why do we need writefds?
+    // to make sure that whatever the data send() is sending to the client fulfills the buffer capacity;
+    // without it we were blocking the network for other clients to connect until the buffer is empty to fill.
+
+    fd_set readfds, writefds;
     client_state_t clients[MAX_CLIENTS];
     char buffer[1024];
 
@@ -56,6 +66,8 @@ int main()
         clients[i].fd = 0;
         clients[i].connect_time = 0;
         clients[i].ready_to_send = 0;
+        clients[i].write_offset = 0;
+        clients[i].write_len = 0;
     }
 
     socket_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -100,8 +112,9 @@ int main()
     while (1)
     {
         memset(&conn_addr, 0, sizeof(conn_addr));
-        // clearing the socket set;
+        // clearing the socket set (read and write);
         FD_ZERO(&readfds);
+        FD_ZERO(&writefds);
 
         // adding master socket to set;
         FD_SET(socket_fd, &readfds);
@@ -114,6 +127,10 @@ int main()
             if (sd > 0)
             {
                 FD_SET(sd, &readfds);
+                if (clients[i].write_len > 0)
+                {
+                    FD_SET(sd, &writefds);
+                }
             }
 
             if (sd > max_sd)
@@ -131,14 +148,19 @@ int main()
         // with select() => is like having a monitor all the phones, but still we can answer one at a time;
         // if we dont' select the timeout for it, without it select method will not return to it.
         // it's like we talk on phone 1 for(10 sec), then puts it on hold then talk on next phone, again put on hold after 10sec.
-        
-        activity = select(max_sd + 1, &readfds, NULL, NULL, NULL);
+
+        struct timeval timeout;
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+
+        activity = select(max_sd + 1, &readfds, &writefds, NULL, &timeout);
 
         if ((activity < 0) && (errno != EINTR))
         {
             perror("select error");
         }
 
+        // checking for new connections
         if (FD_ISSET(socket_fd, &readfds))
         {
             client_fd = accept(socket_fd, (struct sockaddr *)&conn_addr, &addr_size);
@@ -147,6 +169,8 @@ int main()
                 perror("accept");
                 continue;
             }
+
+            set_nonblocking(client_fd);
 
             printf("New connection, socket fd is %d\n", client_fd);
 
@@ -157,6 +181,8 @@ int main()
                     clients[i].fd = client_fd;
                     clients[i].connect_time = time(NULL);
                     clients[i].ready_to_send = 0;
+                    clients[i].write_offset = 0;
+                    clients[i].write_len = 0;
                     printf("adding to list of sockets as %d\n", i);
                     break;
                 }
@@ -178,36 +204,91 @@ int main()
             {
                 continue;
             }
+            srand(0);
+            int random_number = rand() % 20;
 
-            if (!clients[i].ready_to_send && (current_time - clients[i].connect_time >= 10))
+            if (!clients[i].ready_to_send && (current_time - clients[i].connect_time >= random_number))
             {
                 clients[i].ready_to_send = 1;
-                char msg[256];
 
-                snprintf(msg, sizeof(msg),
-                        "HTTP/1.1 200 OK\r\n"
-                        "Content-Type: text/plain\r\n"
-                        "\r\n"
-                        "Hello from server!\n"
-                        "client no. %d\n",
-                        i
-                );
-                send(sd, msg, strlen(msg), 0);
+                clients[i].write_len = snprintf(clients[i].write_buffer, sizeof(clients[i].write_buffer),
+                                        "HTTP/1.1 200 OK\r\n"
+                                        "Content-Type: text/plain\r\n"
+                                        "\r\n"
+                                        "Hello from server!\n"
+                                        "client no. %d\n",
+                                        i);
+                clients[i].write_offset = 0;
+                printf("client %d ready to receive response\n", i);
             }
 
-            if(FD_ISSET(sd, &readfds)) {
+            // handling write events (socket read to send);
+            if (FD_ISSET(sd, &writefds) && clients[i].write_len > 0)
+            {
+                int bytes_to_send = clients[i].write_len - clients[i].write_offset;
+                int sent = send(sd, clients[i].write_buffer + clients[i].write_offset, bytes_to_send, 0);
+
+                if (sent > 0)
+                {
+                    clients[i].write_offset += sent;
+
+                    printf("Sent %d bytes to client %d (%d/%d total)\n", sent, i, clients[i].write_offset, clients[i].write_len);
+
+                    if (clients[i].write_offset >= clients[i].write_len)
+                    {
+                        clients[i].write_offset = 0;
+                        clients[i].write_len = 0;
+                        printf("finished sending response to client %d\n", i);
+                    }
+                }
+                else if (sent == -1)
+                {
+                    if (errno != EAGAIN && errno != EWOULDBLOCK)
+                    {
+                        perror("send error");
+                        close(sd);
+                        clients[i].fd = 0;
+                        clients[i].connect_time = 0;
+                        clients[i].ready_to_send = 0;
+                        clients[i].write_len = 0;
+                        clients[i].write_offset = 0;
+                    }
+                }
+            }
+
+            // handling read events (socket ready to read);
+            if (FD_ISSET(sd, &readfds))
+            {
                 int valread = recv(sd, buffer, sizeof(buffer), 0);
                 printf("valread value: %d\n", valread);
 
-                if(valread == 0) {
+                if (valread == 0)
+                {
                     printf("client disconnected, socket fd %d\n", sd);
                     close(sd);
                     clients[i].fd = 0;
                     clients[i].connect_time = 0;
                     clients[i].ready_to_send = 0;
-                } else if(valread > 0) {
+                    clients[i].write_len = 0;
+                    clients[i].write_offset = 0;
+                }
+                else if (valread > 0)
+                {
                     buffer[valread] = '\0';
                     printf("received data from socket %d: %d bytes\n", sd, valread);
+                }
+                else if (valread == -1)
+                {
+                    if (errno != EAGAIN && errno != EWOULDBLOCK)
+                    {
+                        perror("recv error");
+                        close(sd);
+                        clients[i].fd = 0;
+                        clients[i].connect_time = 0;
+                        clients[i].ready_to_send = 0;
+                        clients[i].write_len = 0;
+                        clients[i].write_offset = 0;
+                    }
                 }
             }
         }

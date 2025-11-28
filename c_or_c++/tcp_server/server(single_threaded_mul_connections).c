@@ -26,6 +26,7 @@ typedef struct
     char write_buffer[256];
     int write_offset;
     int write_len;
+    int random_delay;
 } client_state_t;
 
 // without this function, we have by default blocking mode, meaning until the process is
@@ -60,6 +61,8 @@ int main()
     fd_set readfds, writefds;
     client_state_t clients[MAX_CLIENTS];
     char buffer[1024];
+
+    srand(time(NULL));
 
     for (i = 0; i < MAX_CLIENTS; i++)
     {
@@ -183,6 +186,7 @@ int main()
                     clients[i].ready_to_send = 0;
                     clients[i].write_offset = 0;
                     clients[i].write_len = 0;
+                    clients[i].random_delay = rand() % 20 + 1;
                     printf("adding to list of sockets as %d\n", i);
                     break;
                 }
@@ -196,6 +200,7 @@ int main()
         }
 
         time_t current_time = time(NULL);
+
         for (i = 0; i < MAX_CLIENTS; i++)
         {
             int sd = clients[i].fd;
@@ -204,20 +209,19 @@ int main()
             {
                 continue;
             }
-            srand(0);
-            int random_number = rand() % 20;
-
-            if (!clients[i].ready_to_send && (current_time - clients[i].connect_time >= random_number))
+            if (!clients[i].ready_to_send && (current_time - clients[i].connect_time >= clients[i].random_delay))
             {
                 clients[i].ready_to_send = 1;
 
                 clients[i].write_len = snprintf(clients[i].write_buffer, sizeof(clients[i].write_buffer),
-                                        "HTTP/1.1 200 OK\r\n"
-                                        "Content-Type: text/plain\r\n"
-                                        "\r\n"
-                                        "Hello from server!\n"
-                                        "client no. %d\n",
-                                        i);
+                                                "HTTP/1.1 200 OK\r\n"
+                                                "Content-Type: text/plain\r\n"
+                                                "\r\n"
+                                                "Hello from server!\n"
+                                                "client no. %d\n"
+                                                "waited %d seconds \n",
+                                                i,
+                                                clients[i].random_delay);
                 clients[i].write_offset = 0;
                 printf("client %d ready to receive response\n", i);
             }
